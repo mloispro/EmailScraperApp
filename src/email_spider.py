@@ -3,9 +3,18 @@ import csv
 import re
 import time
 from urllib.parse import urlparse, urljoin
-import scrapy
-from bs4 import BeautifulSoup
-import requests
+try:
+    import scrapy
+except ImportError:
+    scrapy = None
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+try:
+    import requests
+except ImportError:
+    requests = None
 import threading
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
@@ -48,15 +57,25 @@ def get_selenium_driver():
         selenium_drivers.append(driver)
     return thread_local.driver
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+except ImportError:
+    webdriver = None
+    Options = None
+    By = None
+    WebDriverWait = None
+    EC = None
 
 # Standalone spider class for potential Scrapy integration.
-class EmailSpider(scrapy.Spider):
-    name = "email_spider"
+if scrapy:
+    class EmailSpider(scrapy.Spider):
+        name = "email_spider"
+else:
+    EmailSpider = None
 
 def is_valid_url(url):
     """Validate a URL by checking its scheme and network location."""
@@ -74,12 +93,8 @@ def get_provider_website(row):
     """
     if len(row) > 13:
         candidate = row[13].strip()
-        if candidate:
-            logging.debug(f"Found candidate URL in column 13: {candidate}")
-        if candidate and candidate.startswith("http") and "google.com" not in candidate.lower() and is_valid_url(candidate):
-            logging.info(f"Using provider website: {candidate}")
+        if candidate and candidate.startswith("http") and "google.com" not in candidate.lower():
             return candidate
-    logging.warning("No valid provider website found in the expected column.")
     return ""
 
 def setup_selenium():

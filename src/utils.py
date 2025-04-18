@@ -1,7 +1,7 @@
 import logging
 import re
 from urllib.parse import urlparse
-from bs4 import BeautifulSoup
+# BeautifulSoup removed; we'll use regex-based extraction only
 
 def is_valid_url(url):
     """Validate a URL by checking its scheme and network location."""
@@ -20,13 +20,8 @@ def extract_emails_from_html(html):
     for match in re.findall(email_regex, html):
         if not any(word in match.lower() for word in ['logo', 'icon', 'banner']):
             emails.add(match)
-    # Check for mailto links
-    try:
-        soup = BeautifulSoup(html, 'html.parser')
-        for a in soup.find_all('a', href=re.compile(r'^mailto:', re.I)):
-            email = a.get('href').split("mailto:")[-1].split('?')[0]
-            if email and not any(word in email.lower() for word in ['logo', 'icon']):
-                emails.add(email)
-    except Exception as e:
-        logging.error(f"Error parsing HTML for mailto links: {e}")
+    # Also extract mailto: links
+    for m in re.findall(r'(?i)mailto:([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})', html):
+        if not any(word in m.lower() for word in ['logo', 'icon']):
+            emails.add(m)
     return emails
