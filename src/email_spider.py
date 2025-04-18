@@ -9,11 +9,36 @@ import requests
 import threading
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+import signal
+import sys
+import logging
+import os
+
+# Configure structured logging with timestamps and thread names
+logging.basicConfig(
+    format='[%(asctime)s] [%(threadName)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    level=logging.INFO
+)
 
 # Thread-local storage for per-thread Selenium drivers
 thread_local = threading.local()
 # Keep track of all drivers to quit at the end
 selenium_drivers = []
+
+# Graceful shutdown: quit all Selenium drivers on termination signals
+def handle_exit(signum, frame):
+    logging.info(f"Received signal {signum}, shutting down...")
+    for drv in selenium_drivers:
+        try:
+            drv.quit()
+        except Exception:
+            pass
+    sys.exit(0)
+
+# Register signal handlers for clean exit
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
 
 def get_selenium_driver():
     """Return a thread-local Selenium driver, creating it on first access."""
@@ -39,7 +64,7 @@ def is_valid_url(url):
         result = urlparse(url)
         return bool(result.scheme and result.netloc)
     except Exception as e:
-        print(f"URL validation error: {e}")
+        logging.error(f"URL validation error: {e}")
         return False
 
 def get_provider_website(row):
@@ -50,11 +75,11 @@ def get_provider_website(row):
     if len(row) > 13:
         candidate = row[13].strip()
         if candidate:
-            print(f"Found candidate URL in column 13: {candidate}")
+            logging.debug(f"Found candidate URL in column 13: {candidate}")
         if candidate and candidate.startswith("http") and "google.com" not in candidate.lower() and is_valid_url(candidate):
-            print(f"Using provider website: {candidate}")
+            logging.info(f"Using provider website: {candidate}")
             return candidate
-    print("No valid provider website found in the expected column.")
+    logging.warning("No valid provider website found in the expected column.")
     return ""
 
 def setup_selenium():
@@ -95,7 +120,7 @@ def click_contact_page(driver):
             for link in links:
                 candidate = link.get_attribute('href')
                 if candidate and is_valid_url(candidate):
-                    print(f"Clicking link: {candidate}")
+                    logging.info(f"Clicking link: {candidate}")
                     driver.get(candidate)
                     try:
                         WebDriverWait(driver, 10).until(
@@ -105,12 +130,12 @@ def click_contact_page(driver):
                         pass
                     return driver.page_source
     except Exception as e:
-        print(f"Error clicking contact/about link: {e}")
+        logging.error(f"Error clicking contact/about link: {e}")
     # Fallback: try appending /contact to base URL
     try:
         base_url = driver.current_url.rstrip('/')
         fallback_url = base_url + "/contact"
-        print(f"Trying fallback URL: {fallback_url}")
+        logging.info(f"Trying fallback URL: {fallback_url}")
         driver.get(fallback_url)
         try:
             WebDriverWait(driver, 10).until(
@@ -120,7 +145,7 @@ def click_contact_page(driver):
             pass
         return driver.page_source
     except Exception as e:
-        print(f"Fallback error: {e}")
+        logging.error(f"Fallback error: {e}")
     return ""
 
 
@@ -131,7 +156,7 @@ def scrape_emails_with_selenium(driver, url):
     """
     emails_found = set()
     try:
-        print(f"\nLoading base page: {url}")
+        logging.info(f"Loading base page: {url}")
         driver.get(url)
         try:
             WebDriverWait(driver, 10).until(
@@ -140,25 +165,25 @@ def scrape_emails_with_selenium(driver, url):
         except Exception:
             pass
     except Exception as e:
-        print(f"Error loading base page {url}: {e}")
+        logging.error(f"Error loading base page {url}: {e}")
         return emails_found
 
     base_html = driver.page_source
-    print(f"Base page length: {len(base_html)}")
+    logging.debug(f"Base page length: {len(base_html)}")
     emails_found.update(extract_emails_from_html(base_html))
     if emails_found:
-        print(f"Emails found on base page: {emails_found}")
+        logging.info(f"Emails found on base page: {emails_found}")
     else:
-        print("No emails found on base page. Trying to click a Contact link...")
+        logging.info("No emails found on base page. Trying to click a Contact link...")
         contact_html = click_contact_page(driver)
         if contact_html:
             emails_found.update(extract_emails_from_html(contact_html))
             if emails_found:
-                print(f"Emails found on contact page: {emails_found}")
+                logging.info(f"Emails found on contact page: {emails_found}")
             else:
-                print("No emails found on contact page.")
+                logging.info("No emails found on contact page.")
         else:
-            print("No contact page was detected.")
+            logging.info("No contact page was detected.")
     return emails_found
 
 def scrape_emails_from_website(website):
@@ -173,7 +198,7 @@ def scrape_emails_from_website(website):
         driver = setup_selenium()
         emails_found = scrape_emails_with_selenium(driver, website)
     except Exception as e:
-        print(f"Error with Selenium for {website}: {e}")
+        logging.error(f"Error with Selenium for {website}: {e}")
     finally:
         if driver is not None:
             driver.quit()
@@ -182,7 +207,7 @@ def scrape_emails_from_website(website):
 def fetch_emails_with_requests(url, timeout=10):
     """Attempt to fetch the page via HTTP and extract emails without rendering."""
     try:
-        print(f"Fetching via requests: {url}")
+        logging.info(f"Fetching via requests: {url}")
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) "  
@@ -192,15 +217,15 @@ def fetch_emails_with_requests(url, timeout=10):
         }
         resp = requests.get(url, headers=headers, timeout=timeout)
         html = resp.text
-        print(f"Requests page length: {len(html)}")
+        logging.debug(f"Requests page length: {len(html)}")
         emails = extract_emails_from_html(html)
         if emails:
-            print(f"Emails found via requests: {emails}")
+            logging.info(f"Emails found via requests: {emails}")
         else:
-            print("No emails found via requests.")
+            logging.info("No emails found via requests.")
         return emails
     except Exception as e:
-        print(f"Error fetching via requests for {url}: {e}")
+        logging.error(f"Error fetching via requests for {url}: {e}")
         return set()
 
 def get_emails_for_website(url):
@@ -212,29 +237,49 @@ def get_emails_for_website(url):
     driver = get_selenium_driver()
     return scrape_emails_with_selenium(driver, url)
 
-def process_csv(input_file, output_file, max_workers=3):
+def process_csv(input_file, output_file, max_workers=3, force=False):
     """Read the input CSV (tab-delimited), process in parallel threads, and write results."""
-    # Read and prepare tasks
+    # Load existing results if not forcing a full scrape
+    output_rows = []
+    processed_websites = set()
+    if not force and os.path.exists(output_file):
+        try:
+            with open(output_file, newline='', encoding='utf-8') as outf:
+                reader_out = csv.DictReader(outf)
+                existing_rows = list(reader_out)
+            output_rows = existing_rows
+            processed_websites = set(r['website'] for r in existing_rows if r.get('website'))
+            logging.info(f"Loaded {len(existing_rows)} existing row(s) from '{output_file}', will skip these websites on resume.")
+        except Exception as e:
+            logging.error(f"Error loading existing output '{output_file}': {e}")
+    else:
+        if force:
+            logging.info("Force mode enabled: ignoring existing output and re-scraping all entries.")
+    # Read and prepare tasks, skipping already processed entries
     tasks = []
     with open(input_file, newline='', encoding='utf-8-sig') as csvfile:
         reader = csv.reader(csvfile, delimiter='\t')
         headers = next(reader, None)
         if headers is None:
-            print("Input CSV is empty.")
+            logging.warning("Input CSV is empty.")
             return
         for row in reader:
             if not any(row) or len(row) < 14:
-                print(f"Skipping row due to insufficient data: {row}")
+                logging.warning(f"Skipping row due to insufficient data: {row}")
                 continue
             website = get_provider_website(row)
             if not website:
-                print(f"Skipping row because no valid non-Google website found: {row}")
+                logging.warning(f"Skipping row because no valid non-Google website found: {row}")
                 continue
             clinic_name = row[1].strip()
             address = row[8].strip()
             phone = row[12].strip()
+            # Skip if already processed
+            if website in processed_websites:
+                logging.debug(f"Skipping already processed website: {website}")
+                continue
             tasks.append((clinic_name, website, address, phone))
-    print(f"Starting threaded processing with {max_workers} workers...")
+    logging.info(f"Starting threaded processing with {max_workers} workers and {len(tasks)} tasks...")
     output_rows = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_single, t): t for t in tasks}
@@ -243,7 +288,7 @@ def process_csv(input_file, output_file, max_workers=3):
                 rows = future.result()
                 output_rows.extend(rows)
             except Exception as e:
-                print(f"Error in task {futures[future]}: {e}")
+                logging.error(f"Error in task {futures[future]}: {e}")
     # Clean up any Selenium drivers created
     for drv in selenium_drivers:
         try:
@@ -257,14 +302,18 @@ def process_csv(input_file, output_file, max_workers=3):
         writer.writeheader()
         for row in output_rows:
             writer.writerow(row)
-    print(f"\nProcessed {len(output_rows)} valid row(s) and saved to '{output_file}'.")
+    logging.info(f"Processed {len(output_rows)} valid row(s) and saved to '{output_file}'.")
 
 def process_single(task):
     clinic_name, website, address, phone = task
-    print(f"\nProcessing clinic: {clinic_name} ({website})")
+    logging.info(f"Starting processing {clinic_name} ({website})")
+    start_time = time.time()
     emails_set = get_emails_for_website(website)
+    duration = time.time() - start_time
     emails_scraped = ";".join(emails_set) if emails_set else ""
-    print(f"Emails scraped for {clinic_name}: {emails_scraped}")
+    logging.info(
+        f"Finished processing {clinic_name} ({website}) in {duration:.2f}s, emails: {emails_scraped or 'none'}"
+    )
     emails_list = [e.strip() for e in emails_scraped.split(';') if e.strip()]
     rows_out = []
     if emails_list:
@@ -291,8 +340,24 @@ def main():
         description="Aggregate clinic CSV data and scrape emails from provider websites using an advanced Selenium approach."
     )
     parser.add_argument("input_csv", type=str, help="Input CSV file with clinic entries")
+    parser.add_argument("-o", "--output", dest="output_csv", type=str,
+                        default="scraped_emails.csv",
+                        help="Output CSV file for scraped emails (default: scraped_emails.csv)")
+    parser.add_argument("-f", "--force", dest="force", action="store_true",
+                        help="Force re-scraping all entries, ignoring existing output file")
+    parser.add_argument("-w", "--workers", dest="workers", type=int, default=3,
+                        help="Number of parallel worker threads (default: 3)")
     args = parser.parse_args()
-    process_csv(args.input_csv, "scraped_emails.csv")
+    try:
+        process_csv(
+            args.input_csv,
+            args.output_csv,
+            max_workers=args.workers,
+            force=args.force
+        )
+    except KeyboardInterrupt:
+        # Handle Ctrl+C from user
+        handle_exit(signal.SIGINT, None)
 
 if __name__ == '__main__':
     main()

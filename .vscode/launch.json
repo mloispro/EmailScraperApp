@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Email Scraper via Batch",
+      "type": "pwa-node",
+      "request": "launch",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/C", "${workspaceFolder}\\run.bat"],
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen"
+    }
+  ]
+}

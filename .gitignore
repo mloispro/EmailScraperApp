@@ -1,5 +1,5 @@
-# Visual Studio Code settings folder
-.vscode/
+# Visual Studio Code settings folder (unignored to commit launch.json for debugging)
+#.vscode/
 
 # Python bytecode and cache files
 __pycache__/
