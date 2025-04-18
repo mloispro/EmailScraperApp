@@ -1,32 +1,5 @@
-# Visual Studio Code settings folder (unignored to commit launch.json for debugging)
-#.vscode/
-
-# Python bytecode and cache files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
-
-# Virtual environment folders (adjust names if needed)
-env/
 venv/
-ENV/
-env.bak/
-venv.bak/
-
-# macOS files
-.DS_Store
-
-# Windows thumbnail cache
-Thumbs.db
-
-# Log files
-*.log
-
-# Ignore the output folder if you don't want it tracked
+__pycache__/
+*.pyc
 output/
-.env
+scraped_emails.csv
