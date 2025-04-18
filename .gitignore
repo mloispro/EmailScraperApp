@@ -4,3 +4,4 @@ __pycache__/
 output/
 scraped_emails.csv.env
 .env
+.env
