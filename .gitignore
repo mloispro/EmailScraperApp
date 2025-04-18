@@ -29,3 +29,4 @@ Thumbs.db
 
 # Ignore the output folder if you don't want it tracked
 output/
+.env

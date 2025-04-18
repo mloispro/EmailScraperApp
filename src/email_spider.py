@@ -5,6 +5,23 @@ import time
 from urllib.parse import urlparse, urljoin
 import scrapy
 from bs4 import BeautifulSoup
+import requests
+import threading
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+# Thread-local storage for per-thread Selenium drivers
+thread_local = threading.local()
+# Keep track of all drivers to quit at the end
+selenium_drivers = []
+
+def get_selenium_driver():
+    """Return a thread-local Selenium driver, creating it on first access."""
+    if not hasattr(thread_local, 'driver'):
+        driver = setup_selenium()
+        thread_local.driver = driver
+        selenium_drivers.append(driver)
+    return thread_local.driver
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -45,9 +62,12 @@ def setup_selenium():
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-gpu")
-    # You can add additional options here (e.g., window size, disable images)
+    chrome_options.add_argument("--ignore-certificate-errors")
+    # Optionally, add --no-sandbox if needed:
+    # chrome_options.add_argument("--no-sandbox")
     driver = webdriver.Chrome(options=chrome_options)
     return driver
+
 
 def extract_emails_from_html(html):
     """Extract emails from HTML while ignoring common image extensions."""
@@ -77,7 +97,12 @@ def click_contact_page(driver):
                 if candidate and is_valid_url(candidate):
                     print(f"Clicking link: {candidate}")
                     driver.get(candidate)
-                    time.sleep(3)
+                    try:
+                        WebDriverWait(driver, 10).until(
+                            lambda d: d.execute_script("return document.readyState") == "complete"
+                        )
+                    except Exception:
+                        pass
                     return driver.page_source
     except Exception as e:
         print(f"Error clicking contact/about link: {e}")
@@ -87,7 +112,12 @@ def click_contact_page(driver):
         fallback_url = base_url + "/contact"
         print(f"Trying fallback URL: {fallback_url}")
         driver.get(fallback_url)
-        time.sleep(3)
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            pass
         return driver.page_source
     except Exception as e:
         print(f"Fallback error: {e}")
@@ -103,7 +133,12 @@ def scrape_emails_with_selenium(driver, url):
     try:
         print(f"\nLoading base page: {url}")
         driver.get(url)
-        time.sleep(3)  # Wait for full page load
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            pass
     except Exception as e:
         print(f"Error loading base page {url}: {e}")
         return emails_found
@@ -142,49 +177,80 @@ def scrape_emails_from_website(website):
     finally:
         if driver is not None:
             driver.quit()
-    return ", ".join(emails_found) if emails_found else ""
+    return ";".join(emails_found) if emails_found else ""
 
-def process_csv(input_file, output_file):
-    output_rows = []
-    with open(input_file, newline='', encoding='utf-8') as csvfile:
-        #reader = csv.reader(csvfile)
+def fetch_emails_with_requests(url, timeout=10):
+    """Attempt to fetch the page via HTTP and extract emails without rendering."""
+    try:
+        print(f"Fetching via requests: {url}")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "  
+                "AppleWebKit/537.36 (KHTML, like Gecko) "  
+                "Chrome/88.0.4324.96 Safari/537.36"
+            )
+        }
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        html = resp.text
+        print(f"Requests page length: {len(html)}")
+        emails = extract_emails_from_html(html)
+        if emails:
+            print(f"Emails found via requests: {emails}")
+        else:
+            print("No emails found via requests.")
+        return emails
+    except Exception as e:
+        print(f"Error fetching via requests for {url}: {e}")
+        return set()
+
+def get_emails_for_website(url):
+    """Try HTTP fetch for speed, then fall back to Selenium rendering if needed."""
+    emails = fetch_emails_with_requests(url)
+    if emails:
+        return emails
+    # Fallback to Selenium using a thread-local driver
+    driver = get_selenium_driver()
+    return scrape_emails_with_selenium(driver, url)
+
+def process_csv(input_file, output_file, max_workers=3):
+    """Read the input CSV (tab-delimited), process in parallel threads, and write results."""
+    # Read and prepare tasks
+    tasks = []
+    with open(input_file, newline='', encoding='utf-8-sig') as csvfile:
         reader = csv.reader(csvfile, delimiter='\t')
         headers = next(reader, None)
         if headers is None:
             print("Input CSV is empty.")
             return
-
-    print("Starting CSV processing...")
-    with open(input_file, newline='', encoding='utf-8') as csvfile:
-        reader = csv.reader(csvfile, delimiter='\t')
-        #reader = csv.reader(csvfile)
-        next(reader, None)  # Skip header
         for row in reader:
             if not any(row) or len(row) < 14:
                 print(f"Skipping row due to insufficient data: {row}")
                 continue
-
             website = get_provider_website(row)
             if not website:
                 print(f"Skipping row because no valid non-Google website found: {row}")
                 continue
-
             clinic_name = row[1].strip()
             address = row[8].strip()
             phone = row[12].strip()
-            print(f"\nProcessing clinic: {clinic_name}")
-
-            emails_scraped = scrape_emails_from_website(website)
-            print(f"Emails scraped for {clinic_name}: {emails_scraped}")
-
-            output_rows.append({
-                "clinic_name": clinic_name,
-                "website": website,
-                "address": address,
-                "phone": phone,
-                "email_addresses": emails_scraped
-            })
-
+            tasks.append((clinic_name, website, address, phone))
+    print(f"Starting threaded processing with {max_workers} workers...")
+    output_rows = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_single, t): t for t in tasks}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                rows = future.result()
+                output_rows.extend(rows)
+            except Exception as e:
+                print(f"Error in task {futures[future]}: {e}")
+    # Clean up any Selenium drivers created
+    for drv in selenium_drivers:
+        try:
+            drv.quit()
+        except Exception:
+            pass
+    # Write results to CSV
     with open(output_file, "w", newline='', encoding='utf-8') as outfile:
         fieldnames = ["clinic_name", "website", "address", "phone", "email_addresses"]
         writer = csv.DictWriter(outfile, fieldnames=fieldnames)
@@ -192,6 +258,33 @@ def process_csv(input_file, output_file):
         for row in output_rows:
             writer.writerow(row)
     print(f"\nProcessed {len(output_rows)} valid row(s) and saved to '{output_file}'.")
+
+def process_single(task):
+    clinic_name, website, address, phone = task
+    print(f"\nProcessing clinic: {clinic_name} ({website})")
+    emails_set = get_emails_for_website(website)
+    emails_scraped = ";".join(emails_set) if emails_set else ""
+    print(f"Emails scraped for {clinic_name}: {emails_scraped}")
+    emails_list = [e.strip() for e in emails_scraped.split(';') if e.strip()]
+    rows_out = []
+    if emails_list:
+        for email in emails_list:
+            rows_out.append({
+                "clinic_name": clinic_name,
+                "website": website,
+                "address": address,
+                "phone": phone,
+                "email_addresses": email
+            })
+    else:
+        rows_out.append({
+            "clinic_name": clinic_name,
+            "website": website,
+            "address": address,
+            "phone": phone,
+            "email_addresses": ""
+        })
+    return rows_out
 
 def main():
     parser = argparse.ArgumentParser(
