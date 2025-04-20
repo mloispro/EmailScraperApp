@@ -25,3 +25,21 @@ def extract_emails_from_html(html):
         if not any(word in m.lower() for word in ['logo', 'icon']):
             emails.add(m)
     return emails
+   
+def parse_address(full_address):
+    """Split a full address string into street, city, and state components."""
+    # Split on commas and trim whitespace
+    parts = [p.strip() for p in full_address.split(',') if p.strip()]
+    street = parts[0] if len(parts) > 0 else ''
+    city = parts[1] if len(parts) > 1 else ''
+    state = ''
+    if len(parts) > 2:
+        # parts[2] may contain state and zip; take first token as state
+        state = parts[2].split()[0]
+    elif len(parts) > 1:
+        # If city and state are combined in parts[1]
+        tokens = parts[1].split()
+        if len(tokens) > 1:
+            state = tokens[-1]
+            city = ' '.join(tokens[:-1])
+    return street, city, state
