@@ -22,6 +22,12 @@ import signal
 import sys
 import logging
 import os
+import json
+# Import parse_address and is_valid_url from utils
+try:
+    from src.utils import parse_address, is_valid_url
+except ImportError:
+    from utils import parse_address, is_valid_url
 
 # Configure structured logging with timestamps and thread names
 logging.basicConfig(
@@ -77,14 +83,6 @@ if scrapy:
 else:
     EmailSpider = None
 
-def is_valid_url(url):
-    """Validate a URL by checking its scheme and network location."""
-    try:
-        result = urlparse(url)
-        return bool(result.scheme and result.netloc)
-    except Exception as e:
-        logging.error(f"URL validation error: {e}")
-        return False
 
 def get_provider_website(row):
     """
@@ -252,103 +250,192 @@ def get_emails_for_website(url):
     driver = get_selenium_driver()
     return scrape_emails_with_selenium(driver, url)
 
+# from selenium.webdriver.common.by import By
+# from selenium.webdriver.support.ui import WebDriverWait
+# from selenium.webdriver.support import expected_conditions as EC
+
+def scrape_google_maps_address(driver, maps_url):
+    """
+    Load a Google Maps place URL and return its full formatted address
+    (as shown in the “Copy address” tooltip).
+    """
+    driver.get(maps_url)
+    # wait until the “Copy address” button appears
+    WebDriverWait(driver, 15).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, 'button[data-tooltip="Copy address"]'))
+    )
+    btn = driver.find_element(By.CSS_SELECTOR, 'button[data-tooltip="Copy address"]')
+    aria = btn.get_attribute("aria-label")  
+    # aria-label is like "Copy address: 1915 Lyndale Ave S, Minneapolis, MN 55403, USA"
+    if aria and ":" in aria:
+        return aria.split(":", 1)[1].strip()
+    return None
+
+
+
+# precompile all our detectors
+_maps_re     = re.compile(r'https?://(?:www\.)?google\.[^/]+/maps/place', re.I)
+_url_re      = re.compile(r'https?://\S+', re.I)
+_phone_re    = re.compile(r'\(?\d{3}\)?[ \-]?\d{3}[ \-]?\d{4}')
+_email_re    = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', re.I)
+_address_re  = re.compile(
+    r'\d+\s+\d*\s*(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Pl|Place)\b',
+    re.I
+)
+
+def parse_row(row):
+    """Return (maps_url, clinic_name, website, address, phone, email) from any CSV row."""
+    maps_url = clinic_name = website = address = phone = email = ''
+    seen = set()
+
+    # first pass: pick URLs, phone, email, address
+    for cell in row:
+        text = cell.strip()
+        if not text:
+            continue
+
+        if not maps_url and _maps_re.search(text):
+            maps_url = text; seen.add(text); continue
+
+        if not website and _url_re.match(text) and 'google.com/maps' not in text:
+            website = text; seen.add(text); continue
+
+        if not phone:
+            m = _phone_re.search(text)
+            if m:
+                phone = m.group(); seen.add(text); continue
+
+        if not email:
+            m = _email_re.search(text)
+            if m:
+                email = m.group(); seen.add(text); continue
+
+        if not address and _address_re.search(text):
+            address = text; seen.add(text); continue
+
+    # second pass: clinic name = first leftover cell
+    for cell in row:
+        text = cell.strip()
+        if text and text not in seen:
+            clinic_name = text
+            break
+
+    return maps_url, clinic_name, website, address, phone, email
+
+
 def process_csv(input_file, output_file, max_workers=3, force=False):
-    """Read the input CSV (tab-delimited), process in parallel threads, and write results."""
-    # Load existing results if not forcing a full scrape
+    """Read CSV of unknown shape, auto-detect fields, then scrape."""
     output_rows = []
     processed_websites = set()
+
     if not force and os.path.exists(output_file):
         try:
             with open(output_file, newline='', encoding='utf-8') as outf:
-                reader_out = csv.DictReader(outf)
-                existing_rows = list(reader_out)
-            output_rows = existing_rows
-            processed_websites = set(r['website'] for r in existing_rows if r.get('website'))
-            logging.info(f"Loaded {len(existing_rows)} existing row(s) from '{output_file}', will skip these websites on resume.")
+                existing = list(csv.DictReader(outf))
+            output_rows = existing
+            processed_websites = {r['website'] for r in existing if r.get('website')}
+            logging.info(f"Loaded {len(existing)} existing row(s).")
         except Exception as e:
-            logging.error(f"Error loading existing output '{output_file}': {e}")
-    else:
-        if force:
-            logging.info("Force mode enabled: ignoring existing output and re-scraping all entries.")
-    # Read and prepare tasks, skipping already processed entries
+            logging.error(f"Error loading '{output_file}': {e}")
+    elif force:
+        logging.info("Force mode enabled.")
+
     tasks = []
     with open(input_file, newline='', encoding='utf-8-sig') as csvfile:
         reader = csv.reader(csvfile, delimiter='\t')
         headers = next(reader, None)
-        if headers is None:
-            logging.warning("Input CSV is empty.")
-            return
+
         for row in reader:
-            if not any(row) or len(row) < 14:
-                logging.warning(f"Skipping row due to insufficient data: {row}")
+            if not any(row):
                 continue
-            website = get_provider_website(row)
-            if not website:
-                logging.warning(f"Skipping row because no valid non-Google website found: {row}")
+
+            maps_url, clinic_name, website, address, phone, email = parse_row(row)
+
+            # skip rows missing critical data
+            if not maps_url or not clinic_name or not website:
+                logging.warning(f"Skipping row (missing maps, name, or site): {row}")
                 continue
-            clinic_name = row[1].strip()
-            address = row[8].strip()
-            phone = row[12].strip()
-            # Skip if already processed
+
             if website in processed_websites:
-                logging.debug(f"Skipping already processed website: {website}")
+                logging.debug(f"Already processed: {website}")
                 continue
-            tasks.append((clinic_name, website, address, phone))
-    logging.info(f"Starting threaded processing with {max_workers} workers and {len(tasks)} tasks...")
-    output_rows = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_single, t): t for t in tasks}
-        for future in concurrent.futures.as_completed(futures):
+
+            tasks.append((clinic_name, maps_url, website, address, phone, email))
+
+    logging.info(f"Queuing {len(tasks)} tasks with {max_workers} workers.")
+    with ThreadPoolExecutor(max_workers=max_workers) as exec:
+        futures = {exec.submit(process_single, t): t for t in tasks}
+        for fut in concurrent.futures.as_completed(futures):
             try:
-                rows = future.result()
-                output_rows.extend(rows)
+                output_rows.extend(fut.result())
             except Exception as e:
-                logging.error(f"Error in task {futures[future]}: {e}")
-    # Clean up any Selenium drivers created
+                logging.error(f"Task {futures[fut]} error: {e}")
+
+    # tear down drivers
     for drv in selenium_drivers:
-        try:
-            drv.quit()
-        except Exception:
-            pass
-    # Write results to CSV
-    with open(output_file, "w", newline='', encoding='utf-8') as outfile:
-        fieldnames = ["clinic_name", "website", "address", "phone", "email_addresses"]
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        try: drv.quit()
+        except: pass
+
+    # write output
+    with open(output_file, "w", newline='', encoding='utf-8') as outf:
+        fieldnames = ["clinic_name","website","address","phone","email_addresses"]
+        writer = csv.DictWriter(outf, fieldnames=fieldnames)
         writer.writeheader()
-        for row in output_rows:
-            writer.writerow(row)
-    logging.info(f"Processed {len(output_rows)} valid row(s) and saved to '{output_file}'.")
+        for r in output_rows:
+            writer.writerow(r)
+
+    logging.info(f"Saved {len(output_rows)} rows to '{output_file}'.")
 
 def process_single(task):
-    clinic_name, website, address, phone = task
-    logging.info(f"Starting processing {clinic_name} ({website})")
-    start_time = time.time()
-    emails_set = get_emails_for_website(website)
-    duration = time.time() - start_time
-    emails_scraped = ";".join(emails_set) if emails_set else ""
-    logging.info(
-        f"Finished processing {clinic_name} ({website}) in {duration:.2f}s, emails: {emails_scraped or 'none'}"
-    )
-    emails_list = [e.strip() for e in emails_scraped.split(';') if e.strip()]
+    """
+    task = (clinic_name, maps_url, website, address, phone, csv_email)
+    returns a list of dicts to write out.
+    """
+    clinic_name, maps_url, website, address, phone, csv_email = task
+    driver = get_selenium_driver()
+
+    # enhance address via Maps if available
+    try:
+        full_address = scrape_google_maps_address(driver, maps_url)
+        address = full_address or address
+    except Exception as e:
+        logging.warning(f"Couldn’t scrape address for {maps_url}: {e}")
+
+    logging.info(f"{clinic_name}: using address → {address}")
+
+    # if the parser already pulled an email, use it; otherwise scrape
+    if csv_email:
+        emails_set = {csv_email}
+        logging.info(f"{clinic_name}: using parsed email {csv_email}")
+    else:
+        logging.info(f"{clinic_name}: scraping emails from {website}")
+        start = time.time()
+        emails_set = get_emails_for_website(website)
+        dur = time.time() - start
+        logging.info(f"  → found {emails_set or 'none'} in {dur:.1f}s")
+
+    # build output rows
     rows_out = []
-    if emails_list:
-        for email in emails_list:
+    if emails_set:
+        for e in emails_set:
             rows_out.append({
-                "clinic_name": clinic_name,
-                "website": website,
-                "address": address,
-                "phone": phone,
-                "email_addresses": email
+                "clinic_name"    : clinic_name,
+                "website"        : website,
+                "address"        : address,
+                "phone"          : phone,
+                "email_addresses": e
             })
     else:
         rows_out.append({
-            "clinic_name": clinic_name,
-            "website": website,
-            "address": address,
-            "phone": phone,
+            "clinic_name"    : clinic_name,
+            "website"        : website,
+            "address"        : address,
+            "phone"          : phone,
             "email_addresses": ""
         })
+
     return rows_out
+
 
 def main():
     parser = argparse.ArgumentParser(
