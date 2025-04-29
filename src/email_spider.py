@@ -333,7 +333,7 @@ def process_csv(input_file, output_file, max_workers=3, force=False):
             with open(output_file, newline='', encoding='utf-8') as outf:
                 existing = list(csv.DictReader(outf))
             output_rows = existing
-            processed_websites = {r['website'] for r in existing if r.get('website')}
+            processed_websites = {r['WEBSITE'] for r in existing if r.get('WEBSITE')}
             logging.info(f"Loaded {len(existing)} existing row(s).")
         except Exception as e:
             logging.error(f"Error loading '{output_file}': {e}")
@@ -343,19 +343,16 @@ def process_csv(input_file, output_file, max_workers=3, force=False):
     tasks = []
     with open(input_file, newline='', encoding='utf-8-sig') as csvfile:
         reader = csv.reader(csvfile, delimiter='\t')
-        headers = next(reader, None)
+        next(reader, None)  # skip header
 
         for row in reader:
             if not any(row):
                 continue
 
             maps_url, clinic_name, website, address, phone, email = parse_row(row)
-
-            # skip rows missing critical data
             if not maps_url or not clinic_name or not website:
                 logging.warning(f"Skipping row (missing maps, name, or site): {row}")
                 continue
-
             if website in processed_websites:
                 logging.debug(f"Already processed: {website}")
                 continue
@@ -363,22 +360,21 @@ def process_csv(input_file, output_file, max_workers=3, force=False):
             tasks.append((clinic_name, maps_url, website, address, phone, email))
 
     logging.info(f"Queuing {len(tasks)} tasks with {max_workers} workers.")
-    with ThreadPoolExecutor(max_workers=max_workers) as exec:
-        futures = {exec.submit(process_single, t): t for t in tasks}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_single, t): t for t in tasks}
         for fut in concurrent.futures.as_completed(futures):
             try:
                 output_rows.extend(fut.result())
             except Exception as e:
                 logging.error(f"Task {futures[fut]} error: {e}")
 
-    # tear down drivers
     for drv in selenium_drivers:
         try: drv.quit()
         except: pass
 
-    # write output
+    # now include CITY in the header
     with open(output_file, "w", newline='', encoding='utf-8') as outf:
-        fieldnames = ["clinic_name","website","address","phone","email_addresses"]
+        fieldnames = ["FIRSTNAME", "WEBSITE", "ADDRESSS", "CITY", "PHONE_NUMBER", "EMAIL"]
         writer = csv.DictWriter(outf, fieldnames=fieldnames)
         writer.writeheader()
         for r in output_rows:
@@ -386,15 +382,17 @@ def process_csv(input_file, output_file, max_workers=3, force=False):
 
     logging.info(f"Saved {len(output_rows)} rows to '{output_file}'.")
 
+                                
+
 def process_single(task):
     """
     task = (clinic_name, maps_url, website, address, phone, csv_email)
-    returns a list of dicts to write out.
+    returns a list of dicts to write out, now including CITY.
     """
     clinic_name, maps_url, website, address, phone, csv_email = task
     driver = get_selenium_driver()
 
-    # enhance address via Maps if available
+    # enrich the address via Google Maps, if possible
     try:
         full_address = scrape_google_maps_address(driver, maps_url)
         address = full_address or address
@@ -403,7 +401,10 @@ def process_single(task):
 
     logging.info(f"{clinic_name}: using address → {address}")
 
-    # if the parser already pulled an email, use it; otherwise scrape
+    # parse street, city, state
+    street, city, state = parse_address(address)
+
+    # decide whether to use the CSV-parsed email or scrape
     if csv_email:
         emails_set = {csv_email}
         logging.info(f"{clinic_name}: using parsed email {csv_email}")
@@ -414,24 +415,25 @@ def process_single(task):
         dur = time.time() - start
         logging.info(f"  → found {emails_set or 'none'} in {dur:.1f}s")
 
-    # build output rows
     rows_out = []
     if emails_set:
         for e in emails_set:
             rows_out.append({
-                "clinic_name"    : clinic_name,
-                "website"        : website,
-                "address"        : address,
-                "phone"          : phone,
-                "email_addresses": e
+                "FIRSTNAME":    clinic_name,
+                "WEBSITE":      website,
+                "ADDRESSS":     address,
+                "CITY":         city,
+                "PHONE_NUMBER": phone,
+                "EMAIL":        e
             })
     else:
         rows_out.append({
-            "clinic_name"    : clinic_name,
-            "website"        : website,
-            "address"        : address,
-            "phone"          : phone,
-            "email_addresses": ""
+            "FIRSTNAME":    clinic_name,
+            "WEBSITE":      website,
+            "ADDRESSS":     address,
+            "CITY":         city,
+            "PHONE_NUMBER": phone,
+            "EMAIL":        ""
         })
 
     return rows_out
