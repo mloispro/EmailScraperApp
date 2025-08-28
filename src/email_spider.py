@@ -92,22 +92,6 @@ else:
     EmailSpider = None
 
 
-def get_provider_website(row):
-    """
-    Return the provider website URL from column 13 if available.
-    It must be non-empty, start with 'http', not contain 'google.com', and pass validation.
-    """
-    if len(row) > 13:
-        candidate = row[13].strip()
-        if (
-            candidate
-            and candidate.startswith("http")
-            and "google.com" not in candidate.lower()
-        ):
-            return candidate
-    return ""
-
-
 def setup_selenium():
     """Initialize and return a headless Selenium Chrome WebDriver."""
     chrome_options = Options()
@@ -272,29 +256,114 @@ def get_emails_for_website(url):
     return scrape_emails_with_selenium(driver, url)
 
 
-# from selenium.webdriver.common.by import By
-# from selenium.webdriver.support.ui import WebDriverWait
-# from selenium.webdriver.support import expected_conditions as EC
-
-
-def scrape_google_maps_address(driver, maps_url):
+def scrape_google_maps_data(driver, maps_url):
     """
-    Load a Google Maps place URL and return its full formatted address
-    (as shown in the “Copy address” tooltip).
+    Enhanced function to scrape phone, website, and full address from Google Maps page.
+    Returns (phone, website, full_address)
     """
-    driver.get(maps_url)
-    # wait until the “Copy address” button appears
-    WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located(
-            (By.CSS_SELECTOR, 'button[data-tooltip="Copy address"]')
+    phone = website = full_address = ""
+
+    try:
+        logging.info(f"Scraping Google Maps data from: {maps_url}")
+        driver.get(maps_url)
+
+        # Wait for the page to load
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, '[data-value="Directions"]')
+            )
         )
-    )
-    btn = driver.find_element(By.CSS_SELECTOR, 'button[data-tooltip="Copy address"]')
-    aria = btn.get_attribute("aria-label")
-    # aria-label is like "Copy address: 1915 Lyndale Ave S, Minneapolis, MN 55403, USA"
-    if aria and ":" in aria:
-        return aria.split(":", 1)[1].strip()
-    return None
+
+        # Get full address from "Copy address" button
+        try:
+            btn = driver.find_element(
+                By.CSS_SELECTOR, 'button[data-tooltip="Copy address"]'
+            )
+            aria = btn.get_attribute("aria-label")
+            if aria and ":" in aria:
+                full_address = aria.split(":", 1)[1].strip()
+                logging.info(f"Found address: {full_address}")
+        except Exception as e:
+            logging.debug(f"Could not extract address: {e}")
+
+        # Extract phone number using multiple selectors
+        phone_selectors = [
+            'button[data-tooltip="Call"]',
+            'button[aria-label*="Call"]',
+            '[data-value="phone"]',
+            "span[data-phone-number]",
+            'a[href^="tel:"]',
+        ]
+
+        for selector in phone_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elements:
+                    # Try aria-label first
+                    aria_label = elem.get_attribute("aria-label")
+                    if aria_label and "Call" in aria_label:
+                        # Extract phone from "Call (218) 736-6987" format
+                        phone_match = re.search(
+                            r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", aria_label
+                        )
+                        if phone_match:
+                            phone = phone_match.group()
+                            logging.info(f"Found phone via aria-label: {phone}")
+                            break
+
+                    # Try href for tel: links
+                    href = elem.get_attribute("href")
+                    if href and href.startswith("tel:"):
+                        phone = href.replace("tel:", "")
+                        logging.info(f"Found phone via href: {phone}")
+                        break
+
+                    # Try text content
+                    text = elem.text.strip()
+                    phone_match = re.search(
+                        r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", text
+                    )
+                    if phone_match:
+                        phone = phone_match.group()
+                        logging.info(f"Found phone via text: {phone}")
+                        break
+
+                if phone:
+                    break
+            except Exception as e:
+                logging.debug(f"Phone selector {selector} failed: {e}")
+
+        # Extract website URL
+        website_selectors = [
+            'a[data-tooltip="Open website"]',
+            'a[aria-label*="Open website"]',
+            '[data-value="website"] a',
+            'a[href^="http"]:not([href*="google.com"]):not([href*="googleusercontent.com"])',
+        ]
+
+        for selector in website_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elements:
+                    href = elem.get_attribute("href")
+                    if (
+                        href
+                        and href.startswith("http")
+                        and "google.com" not in href.lower()
+                    ):
+                        website = href
+                        logging.info(f"Found website: {website}")
+                        break
+                if website:
+                    break
+            except Exception as e:
+                logging.debug(f"Website selector {selector} failed: {e}")
+
+        return phone, website, full_address
+
+    except Exception as e:
+        logging.error(f"Error scraping Google Maps data: {e}")
+        return "", "", ""
 
 
 # precompile all our detectors
@@ -307,53 +376,110 @@ _address_re = re.compile(
     re.I,
 )
 
+# Google domains to exclude when looking for real websites
+_google_domains = [
+    "googleusercontent.com",
+    "googleapis.com",
+    "gstatic.com",
+    "google.com",
+]
 
-def parse_row(row):
-    """Return (maps_url, clinic_name, website, address, phone, email) from any CSV row."""
+
+def parse_row_enhanced(row):
+    """
+    Enhanced parser that handles both CSV formats:
+    - clinics.csv: 14 columns, comma-delimited, no phone/website in CSV
+    - clinics_bak.csv: 21 columns, tab-delimited, has phone[11] and website[12]
+
+    Returns (maps_url, clinic_name, website, address, phone, email)
+    """
     maps_url = clinic_name = website = address = phone = email = ""
     seen = set()
 
-    # first pass: pick URLs, phone, email, address
-    for cell in row:
-        text = cell.strip()
-        if not text:
-            continue
+    # Detect format based on column count
+    is_bak_format = len(row) > 16  # clinics_bak.csv has 21 columns
 
-        if not maps_url and _maps_re.search(text):
-            maps_url = text
-            seen.add(text)
-            continue
+    if is_bak_format:
+        # clinics_bak.csv format - extract from known positions
+        if len(row) > 0 and row[0].strip():
+            candidate = row[0].strip()
+            if _maps_re.search(candidate):
+                maps_url = candidate
+                seen.add(candidate)
 
-        if not website and _url_re.match(text) and "google.com/maps" not in text:
-            website = text
-            seen.add(text)
-            continue
+        if len(row) > 1 and row[1].strip():
+            clinic_name = row[1].strip()
+            seen.add(row[1].strip())
 
-        if not phone:
-            m = _phone_re.search(text)
-            if m:
-                phone = m.group()
+        if len(row) > 11 and row[11].strip():
+            phone_candidate = row[11].strip()
+            phone_match = _phone_re.search(phone_candidate)
+            if phone_match:
+                phone = phone_match.group()
+                seen.add(phone_candidate)
+
+        if len(row) > 12 and row[12].strip():
+            website_candidate = row[12].strip()
+            if website_candidate.startswith("http") and not any(
+                domain in website_candidate.lower() for domain in _google_domains
+            ):
+                website = website_candidate
+                seen.add(website_candidate)
+
+        if len(row) > 8 and row[8].strip():
+            address_candidate = row[8].strip()
+            if _address_re.search(address_candidate):
+                address = address_candidate
+                seen.add(address_candidate)
+    else:
+        # clinics.csv format - use original logic but exclude Google image URLs
+        for cell in row:
+            text = cell.strip()
+            if not text:
+                continue
+
+            if not maps_url and _maps_re.search(text):
+                maps_url = text
                 seen.add(text)
                 continue
 
-        if not email:
-            m = _email_re.search(text)
-            if m:
-                email = m.group()
+            # Enhanced website detection - exclude Google domains
+            if (
+                not website
+                and _url_re.match(text)
+                and "google.com/maps" not in text
+                and not any(domain in text.lower() for domain in _google_domains)
+            ):
+                website = text
                 seen.add(text)
                 continue
 
-        if not address and _address_re.search(text):
-            address = text
-            seen.add(text)
-            continue
+            if not phone:
+                m = _phone_re.search(text)
+                if m:
+                    phone = m.group()
+                    seen.add(text)
+                    continue
 
-    # second pass: clinic name = first leftover cell
-    for cell in row:
-        text = cell.strip()
-        if text and text not in seen:
-            clinic_name = text
-            break
+            if not email:
+                m = _email_re.search(text)
+                if m:
+                    email = m.group()
+                    seen.add(text)
+                    continue
+
+            if not address and _address_re.search(text):
+                address = text
+                seen.add(text)
+                continue
+
+    # If clinic_name not found yet, use first unseen cell
+    if not clinic_name:
+        for cell in row:
+            text = cell.strip()
+            if text and text not in seen:
+                clinic_name = text
+                break
 
     return maps_url, clinic_name, website, address, phone, email
 
@@ -389,26 +515,41 @@ def process_csv(input_file, output_file, max_workers=3, force=False):
             comma_count = sample.count(",")
             delimiter = "\t" if tab_count > comma_count else ","
 
+        logging.info(
+            f"Detected delimiter: {'TAB' if delimiter == chr(9) else repr(delimiter)}"
+        )
+
         reader = csv.reader(csvfile, delimiter=delimiter)
-        next(reader, None)  # skip header
+        header = next(reader, None)  # skip header
+        logging.info(f"CSV has {len(header)} columns")
 
+        # Skip empty rows
         for row in reader:
-            if not any(row):
+            if not any(cell.strip() for cell in row):
                 continue
 
-            maps_url, clinic_name, website, address, phone, email = parse_row(row)
+            maps_url, clinic_name, website, address, phone, email = parse_row_enhanced(
+                row
+            )
+
             if not maps_url or not clinic_name:
-                logging.warning(f"Skipping row (missing maps or name): {row}")
+                logging.warning(
+                    f"Skipping row (missing maps or name): {clinic_name or 'UNKNOWN'}"
+                )
                 continue
-            if website in processed_websites:
-                logging.debug(f"Already processed: {website}")
+
+            # Create unique identifier for deduplication
+            identifier = website or maps_url
+            if identifier in processed_websites:
+                logging.debug(f"Already processed: {identifier}")
                 continue
 
             tasks.append((clinic_name, maps_url, website, address, phone, email))
+            processed_websites.add(identifier)
 
     logging.info(f"Queuing {len(tasks)} tasks with {max_workers} workers.")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_single, t): t for t in tasks}
+        futures = {executor.submit(process_single_enhanced, t): t for t in tasks}
         for fut in concurrent.futures.as_completed(futures):
             try:
                 output_rows.extend(fut.result())
@@ -421,12 +562,12 @@ def process_csv(input_file, output_file, max_workers=3, force=False):
         except:
             pass
 
-    # now include CITY in the header
+    # Write output with proper headers
     with open(output_file, "w", newline="", encoding="utf-8") as outf:
         fieldnames = [
             "FIRSTNAME",
             "WEBSITE",
-            "ADDRESSS",
+            "ADDRESS",
             "CITY",
             "PHONE_NUMBER",
             "EMAIL",
@@ -439,34 +580,49 @@ def process_csv(input_file, output_file, max_workers=3, force=False):
     logging.info(f"Saved {len(output_rows)} rows to '{output_file}'.")
 
 
-def process_single(task):
+def process_single_enhanced(task):
     """
+    Enhanced processing function.
     task = (clinic_name, maps_url, website, address, phone, csv_email)
-    returns a list of dicts to write out, now including CITY.
+    returns a list of dicts to write out, including CITY.
     """
     clinic_name, maps_url, website, address, phone, csv_email = task
     driver = get_selenium_driver()
 
-    # enrich the address via Google Maps, if possible
-    try:
-        full_address = scrape_google_maps_address(driver, maps_url)
-        address = full_address or address
-    except Exception as e:
-        logging.warning(f"Couldn’t scrape address for {maps_url}: {e}")
+    # First, try to enhance data from Google Maps if needed
+    enhanced_phone = phone
+    enhanced_website = website
+    enhanced_address = address
 
-    logging.info(f"{clinic_name}: using address → {address}")
+    # If we're missing critical data, scrape it from Google Maps
+    if not phone or not website or not address:
+        try:
+            scraped_phone, scraped_website, scraped_address = scrape_google_maps_data(
+                driver, maps_url
+            )
+            enhanced_phone = enhanced_phone or scraped_phone
+            enhanced_website = enhanced_website or scraped_website
+            enhanced_address = enhanced_address or scraped_address
+        except Exception as e:
+            logging.warning(
+                f"Couldn't enhance data from Google Maps for {maps_url}: {e}"
+            )
 
-    # parse street, city, state
-    street, city, state = parse_address(address)
+    logging.info(
+        f"{clinic_name}: Phone={enhanced_phone}, Website={enhanced_website}, Address={enhanced_address}"
+    )
 
-    # decide whether to use the CSV-parsed email or scrape
+    # Parse street, city, state from the address
+    street, city, state = parse_address(enhanced_address)
+
+    # Determine email strategy
     if csv_email:
         emails_set = {csv_email}
         logging.info(f"{clinic_name}: using parsed email {csv_email}")
-    elif website:
-        logging.info(f"{clinic_name}: scraping emails from {website}")
+    elif enhanced_website:
+        logging.info(f"{clinic_name}: scraping emails from {enhanced_website}")
         start = time.time()
-        emails_set = get_emails_for_website(website)
+        emails_set = get_emails_for_website(enhanced_website)
         dur = time.time() - start
         logging.info(f"  → found {emails_set or 'none'} in {dur:.1f}s")
     else:
@@ -479,10 +635,10 @@ def process_single(task):
             rows_out.append(
                 {
                     "FIRSTNAME": clinic_name,
-                    "WEBSITE": website,
-                    "ADDRESSS": address,
+                    "WEBSITE": enhanced_website,
+                    "ADDRESS": enhanced_address,
                     "CITY": city,
-                    "PHONE_NUMBER": phone,
+                    "PHONE_NUMBER": enhanced_phone,
                     "EMAIL": e,
                 }
             )
@@ -490,10 +646,10 @@ def process_single(task):
         rows_out.append(
             {
                 "FIRSTNAME": clinic_name,
-                "WEBSITE": website,
-                "ADDRESSS": address,
+                "WEBSITE": enhanced_website,
+                "ADDRESS": enhanced_address,
                 "CITY": city,
-                "PHONE_NUMBER": phone,
+                "PHONE_NUMBER": enhanced_phone,
                 "EMAIL": "",
             }
         )
@@ -503,7 +659,7 @@ def process_single(task):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Aggregate clinic CSV data and scrape emails from provider websites using an advanced Selenium approach."
+        description="Enhanced clinic CSV processor that handles both formats and scrapes emails from provider websites."
     )
     parser.add_argument(
         "input_csv", type=str, help="Input CSV file with clinic entries"
