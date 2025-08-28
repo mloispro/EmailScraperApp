@@ -473,13 +473,37 @@ def parse_row_enhanced(row):
                 seen.add(text)
                 continue
 
-    # If clinic_name not found yet, use first unseen cell
+    # If clinic_name not found yet, use first unseen cell that looks like a name
     if not clinic_name:
         for cell in row:
             text = cell.strip()
-            if text and text not in seen:
+            if (
+                text
+                and text not in seen
+                and not text.startswith("http")
+                and len(text) < 200
+                and not any(domain in text.lower() for domain in _google_domains)
+                and not text.endswith("=w122-h92-k-no")
+                and not text.endswith("=w163-h92-k-no")
+                and "googleusercontent.com" not in text.lower()
+                and not text.startswith("!")
+            ):  # Skip Google Maps internal IDs
                 clinic_name = text
                 break
+
+    # Final fallback - extract name from Maps URL if still no name found
+    if not clinic_name and maps_url:
+        # Extract church name from Google Maps URL
+        import urllib.parse
+
+        if "/place/" in maps_url:
+            try:
+                name_part = maps_url.split("/place/")[1].split("/")[0]
+                name_part = urllib.parse.unquote_plus(name_part)
+                if name_part and len(name_part) < 200:
+                    clinic_name = name_part
+            except Exception:
+                pass
 
     return maps_url, clinic_name, website, address, phone, email
 
@@ -503,20 +527,47 @@ def process_csv(input_file, output_file, max_workers=3, force=False):
 
     tasks = []
     with open(input_file, newline="", encoding="utf-8-sig") as csvfile:
-        # Auto-detect delimiter by reading first few lines
-        sample = csvfile.read(1024)
+        # Enhanced delimiter detection for complex Google Maps URLs
+        sample = csvfile.read(3000)
         csvfile.seek(0)
-        sniffer = csv.Sniffer()
-        try:
-            delimiter = sniffer.sniff(sample).delimiter
-        except Exception:
-            # Fallback: check if sample contains more tabs or commas
-            tab_count = sample.count("\t")
-            comma_count = sample.count(",")
-            delimiter = "\t" if tab_count > comma_count else ","
+
+        # Count different potential delimiters in the sample
+        tab_count = sample.count("\t")
+        comma_count = sample.count(",")
+        semicolon_count = sample.count(";")
+        pipe_count = sample.count("|")
+
+        # Look for the most common delimiter that makes sense
+        delimiter_counts = [
+            (tab_count, "\t"),
+            (comma_count, ","),
+            (semicolon_count, ";"),
+            (pipe_count, "|"),
+        ]
+
+        # Sort by count, descending
+        delimiter_counts.sort(key=lambda x: x[0], reverse=True)
+
+        # Choose delimiter with highest count that's reasonably high
+        delimiter = ","  # default fallback
+        for count, delim in delimiter_counts:
+            if count >= 10:  # Must have at least 10 occurrences
+                delimiter = delim
+                break
+
+        # Override if we detect a clear pattern in the first few lines
+        lines = sample.split("\n")[:5]  # Check first 5 lines
+        for line in lines:
+            if line.count("\t") >= 10 and line.count("\t") > line.count(","):
+                delimiter = "\t"
+                break
+            elif line.count(",") >= 10 and line.count(",") > line.count("\t"):
+                delimiter = ","
+                break
 
         logging.info(
-            f"Detected delimiter: {'TAB' if delimiter == chr(9) else repr(delimiter)}"
+            f"Enhanced delimiter detection: {'TAB' if delimiter == chr(9) else repr(delimiter)} "
+            f"(tabs: {tab_count}, commas: {comma_count})"
         )
 
         reader = csv.reader(csvfile, delimiter=delimiter)
